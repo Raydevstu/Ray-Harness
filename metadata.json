@@ -1,0 +1,10 @@
+{
+  "name": "Codex AI Desktop IDE",
+  "description": "Enterprise-grade high-density DeepSeek & Codex desktop AI IDE with real-time reasoning, split inspector, and workspace context.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
