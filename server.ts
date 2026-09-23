@@ -4,13 +4,45 @@ import dotenv from "dotenv";
 import fs from "fs";
 import { GoogleGenAI, Modality, ThinkingLevel } from "@google/genai";
 import { createServer as createViteServer } from "vite";
+import { GeminiProviderAdapter } from "./server/providers/geminiProvider";
 
 dotenv.config();
 
 const app = express();
 const PORT = 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ limit: "50mb", extended: true }));
+
+const geminiAdapter = new GeminiProviderAdapter();
+
+// Provider-neutral model execution API route
+app.post("/api/model/execute", async (req, res) => {
+  const request = req.body;
+
+  // Request validation
+  if (
+    !request ||
+    typeof request.requestId !== "string" ||
+    typeof request.sessionId !== "string" ||
+    typeof request.modelId !== "string" ||
+    typeof request.compiledContext !== "string"
+  ) {
+    res.status(400).json({
+      error: "Malformed ModelRequest: Required fields (requestId, sessionId, modelId, compiledContext) are missing or invalid.",
+    });
+    return;
+  }
+
+  try {
+    const response = await geminiAdapter.execute(request);
+    res.json(response);
+  } catch (err: any) {
+    res.status(500).json({
+      error: `Server-side model execution crashed: ${err.message}`,
+    });
+  }
+});
 
 let aiClient: GoogleGenAI | null = null;
 function getAi(): GoogleGenAI | null {
@@ -78,6 +110,51 @@ app.post("/api/render-layout", (req, res) => {
   res.json({ rendered: rendered.trim() });
 });
 
+const isQuotaOrRateLimitError = (err: any): boolean => {
+  if (!err) return false;
+  if (err.status === 429 || err.code === 429) return true;
+  const msg = (String(err?.message || "") + " " + JSON.stringify(err || "")).toLowerCase();
+  return (
+    msg.includes("429") ||
+    msg.includes("resource_exhausted") ||
+    msg.includes("quota exceeded") ||
+    msg.includes("rate-limits") ||
+    msg.includes("free_tier_requests") ||
+    msg.includes("too many requests") ||
+    msg.includes("limit") ||
+    msg.includes("exhausted")
+  );
+};
+
+const isUnavailableOrHighDemand = (err: any): boolean => {
+  if (!err) return false;
+  if (err.status === 503 || err.code === 503) return true;
+  const msg = (String(err?.message || "") + " " + JSON.stringify(err || "")).toLowerCase();
+  return (
+    msg.includes("503") ||
+    msg.includes("unavailable") ||
+    msg.includes("high demand") ||
+    msg.includes("spikes in demand") ||
+    msg.includes("temporarily unavailable") ||
+    msg.includes("try again later") ||
+    msg.includes("overloaded") ||
+    msg.includes("over capacity")
+  );
+};
+
+const isRecoverableModelError = (err: any): boolean => {
+  if (!err) return false;
+  const status = err.status || err.code;
+  return (
+    status === 503 ||
+    status === 429 ||
+    status === 404 ||
+    status === 500 ||
+    isQuotaOrRateLimitError(err) ||
+    isUnavailableOrHighDemand(err)
+  );
+};
+
 // Chat / Reasoning Stream endpoint with Document Context Ingestion
 app.post("/api/chat", async (req, res) => {
   const {
@@ -113,9 +190,7 @@ app.post("/api/chat", async (req, res) => {
   if (requestedModel === "5.6 Luna Light" || requestedModel === "gemini-3.1-flash-lite") {
     selectedModel = "gemini-3.1-flash-lite";
   } else if (requestedModel === "Gemini 3.5 Flash" || requestedModel === "gemini-3.5-flash") {
-    selectedModel = "gemini-3.8-flash";
-  } else if (requestedModel === "Gemini 3.8 Flash" || requestedModel === "gemini-3.8-flash") {
-    selectedModel = "gemini-3.8-flash";
+    selectedModel = "gemini-3.5-flash";
   } else if (requestedModel === "Gemini 3.1 Pro (High Thinking)" || requestedModel === "gemini-3.1-pro-preview") {
     selectedModel = "gemini-3.1-pro-preview";
   } else {
@@ -128,48 +203,6 @@ app.post("/api/chat", async (req, res) => {
 
   const sendEvent = (event: string, data: unknown) => {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-  };
-
-  const isQuotaOrRateLimitError = (err: any): boolean => {
-    if (!err) return false;
-    if (err.status === 429 || err.code === 429) return true;
-    const msg = String(err?.message || "") + " " + JSON.stringify(err || "");
-    return (
-      msg.includes("429") ||
-      msg.includes("RESOURCE_EXHAUSTED") ||
-      msg.includes("Quota exceeded") ||
-      msg.includes("rate-limits") ||
-      msg.includes("free_tier_requests") ||
-      msg.includes("Too Many Requests")
-    );
-  };
-
-  const isUnavailableOrHighDemand = (err: any): boolean => {
-    if (!err) return false;
-    if (err.status === 503 || err.code === 503) return true;
-    const msg = String(err?.message || "") + " " + JSON.stringify(err || "");
-    return (
-      msg.includes("503") ||
-      msg.includes("UNAVAILABLE") ||
-      msg.includes("high demand") ||
-      msg.includes("Spikes in demand") ||
-      msg.includes("temporarily unavailable") ||
-      msg.includes("try again later") ||
-      msg.includes("overloaded")
-    );
-  };
-
-  const isRecoverableModelError = (err: any): boolean => {
-    if (!err) return false;
-    const status = err.status || err.code;
-    return (
-      status === 503 ||
-      status === 429 ||
-      status === 404 ||
-      status === 500 ||
-      isQuotaOrRateLimitError(err) ||
-      isUnavailableOrHighDemand(err)
-    );
   };
 
   const ai = getAi();
@@ -290,10 +323,14 @@ When presenting a complete specification, wrap it in a <proposed_plan> block.`,
   const candidateModels: string[] = [
     selectedModel,
     "gemini-3.8-flash",
+    "gemini-3.5-flash",
     "gemini-3.1-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
     "gemini-3.6-flash",
     "gemini-flash-latest",
     "gemini-3.1-pro-preview",
+    "gemini-1.5-pro",
   ].filter((m, i, arr) => arr.indexOf(m) === i);
 
   try {
@@ -310,30 +347,64 @@ When presenting a complete specification, wrap it in a <proposed_plan> block.`,
 
     for (let i = 0; i < candidateModels.length; i++) {
       const modelToTry = candidateModels[i];
-      try {
-        if (i > 0) {
-          sendEvent("thought", {
-            text: `Upstream service for previous model reported high traffic / quota limit. Seamlessly routing to ${modelToTry}...`,
-            step: 1,
+      const MAX_RETRIES_PER_MODEL = 2;
+
+      for (let retry = 0; retry <= MAX_RETRIES_PER_MODEL; retry++) {
+        try {
+          if (retry > 0) {
+            let delay = Math.min(1000 * Math.pow(2, retry), 5000);
+            const serverDelay = parseRetryDelay(lastError);
+            if (serverDelay !== null) {
+              delay = serverDelay;
+              console.log(`Respecting server-provided retry delay: ${delay}ms`);
+              
+              // If the server-suggested delay is too long (e.g. > 10s), skip retries and fail over immediately
+              if (delay > 10000 && i < candidateModels.length - 1) {
+                console.warn(`Server delay ${delay}ms is too long. Failing over to next model immediately.`);
+                break; 
+              }
+            }
+            await new Promise((resolve) => setTimeout(resolve, delay));
+          }
+
+          if (i > 0 || retry > 0) {
+            const isQuotaExceeded = isQuotaOrRateLimitError(lastError);
+            const reason = retry > 0 
+              ? (isQuotaExceeded ? "Quota exceeded (waiting to retry)" : `Transient error (retry ${retry})`)
+              : (isQuotaExceeded ? "Quota exceeded on primary model" : "Upstream service reported high traffic / quota limit");
+            
+            sendEvent("thought", {
+              text: `${reason}. Seamlessly routing/retrying ${modelToTry}...`,
+              step: 1,
+            });
+          }
+
+          responseStream = await ai.models.generateContentStream({
+            model: modelToTry,
+            contents,
+            config: getModelConfig(modelToTry),
           });
+
+          activeModelUsed = modelToTry;
+          lastError = null;
+          break; // Success! Exit retry loop
+        } catch (err: any) {
+          lastError = err;
+          console.warn(`Attempt with ${modelToTry} (retry ${retry}) failed:`, err?.status || err?.code, err?.message);
+
+          if (retry < MAX_RETRIES_PER_MODEL && isRecoverableModelError(err)) {
+            continue; // Retry same model
+          } else if (i < candidateModels.length - 1 && isRecoverableModelError(err)) {
+            break; // Out of retries, but can fall back to next model
+          } else {
+            // Non-recoverable or out of models/retries
+            break;
+          }
         }
-        responseStream = await ai.models.generateContentStream({
-          model: modelToTry,
-          contents,
-          config: getModelConfig(modelToTry),
-        });
-        activeModelUsed = modelToTry;
-        lastError = null;
+      }
+
+      if (responseStream) {
         break;
-      } catch (err: any) {
-        lastError = err;
-        console.warn(`Attempt with ${modelToTry} failed:`, err?.status || err?.code, err?.message);
-        if (i < candidateModels.length - 1 && isRecoverableModelError(err)) {
-          continue;
-        }
-        if (i < candidateModels.length - 1) {
-          continue;
-        }
       }
     }
 
@@ -381,7 +452,7 @@ When presenting a complete specification, wrap it in a <proposed_plan> block.`,
   }
 });
 
-// Text-To-Speech (TTS) using gemini-3.1-flash-tts-preview
+// Text-To-Speech (TTS) using gemini-3.1-flash-tts-preview with resilient fallbacks
 app.post("/api/tts", async (req, res) => {
   const { text, voice = "Kore" } = req.body;
 
@@ -399,37 +470,50 @@ app.post("/api/tts", async (req, res) => {
     return;
   }
 
-  try {
-    const trimmedText = text.slice(0, 300);
-    const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-tts-preview",
-      contents: [{ parts: [{ text: trimmedText }] }],
-      config: {
-        responseModalities: [Modality.AUDIO],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: voice || "Kore" },
+  const ttsModels = ["gemini-3.1-flash-tts-preview"];
+  let lastError: any = null;
+
+  for (const modelName of ttsModels) {
+    try {
+      const trimmedText = text.slice(0, 500);
+      const response = await ai.models.generateContent({
+        model: modelName,
+        contents: [{ parts: [{ text: trimmedText }] }],
+        config: {
+          responseModalities: [Modality.AUDIO],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: voice || "Kore" },
+            },
           },
         },
-      },
-    });
+      });
 
-    const base64Audio =
-      response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
 
-    if (!base64Audio) {
-      res.json({ fallback: true });
-      return;
+      if (base64Audio) {
+        res.json({
+          audio: base64Audio,
+          mimeType: "audio/wav",
+        });
+        return;
+      }
+    } catch (err: any) {
+      lastError = err;
+      if (isQuotaOrRateLimitError(err)) {
+        // Immediately return fallback on quota/rate limit without retries or noisy errors
+        res.json({ fallback: true, message: "TTS quota reached, using browser speech synthesis." });
+        return;
+      }
+      console.warn(`TTS attempt with ${modelName} failed:`, err.message);
     }
-
-    res.json({
-      audio: base64Audio,
-      mimeType: "audio/wav",
-    });
-  } catch (err: any) {
-    console.error("TTS generation error:", err);
-    res.json({ fallback: true, error: err?.message });
   }
+
+  // Final fallback to client-side Web Speech API
+  res.json({
+    fallback: true,
+    error: lastError?.message || "All TTS models failed",
+  });
 });
 
 // Command Exec Processor Pipeline endpoint (Sandboxed command execution)
@@ -559,6 +643,34 @@ app.get("/api/workspace/files", (_req, res) => {
     ],
   });
 });
+
+function parseRetryDelay(err: any): number | null {
+  if (!err) return null;
+  const msg = (err.message || "").toLowerCase() + " " + JSON.stringify(err || "");
+  
+  // 1. Regex fallback for "Please retry in X.Y s"
+  const textMatch = msg.match(/please retry in (\d+\.?\d*)s/i);
+  if (textMatch) {
+    return parseFloat(textMatch[1]) * 1000;
+  }
+  
+  // 2. Try to parse from JSON if available in message
+  try {
+    const jsonMatch = msg.match(/\{.*\}/s);
+    if (jsonMatch) {
+      const data = JSON.parse(jsonMatch[0]);
+      const deepError = data?.error?.message ? JSON.parse(data.error.message) : data;
+      const details = deepError?.error?.details || deepError?.details || [];
+      const retryInfo = details.find((d: any) => d["@type"]?.includes("RetryInfo") || d.retryDelay);
+      if (retryInfo?.retryDelay) {
+        const seconds = parseFloat(retryInfo.retryDelay.replace("s", ""));
+        if (!isNaN(seconds)) return seconds * 1000;
+      }
+    }
+  } catch (e) {}
+
+  return null;
+}
 
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
